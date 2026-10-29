@@ -440,6 +440,131 @@ addEventListener("pointerdown", (e) => {
   ring(x, y, hue);
   if (soundFree()) soundPop();
 });
+// ---------- hold buzz: a bumblebee made of irregular wingbeats, not a clean oscillator ----------
+let buzz = null;
+const buzzBuffers = [];
+// Renders a few seconds of wingbeats. Pitch wanders sample by sample, every harmonic's strength
+// random-walks on its own, and breath noise rides each stroke, so no two cycles are alike.
+function renderBuzz(seconds) {
+  const sr = audio.sampleRate, n = Math.floor(sr * seconds), fade = Math.floor(sr * 0.2);
+  const total = n + fade, data = new Float32Array(total);
+  const H = 14, amp = new Float32Array(H).fill(1), ampT = new Float32Array(H).fill(1);
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  let phase = Math.random(), f = 118, fT = 118, noise = 0, env = 1, envT = 1;
+  for (let i = 0; i < total; i++) {
+    if (i % 400 === 0) {   // ~9 ms: pick new wander targets
+      fT = 118 * (1 + rnd(-0.07, 0.07));
+      envT = rnd(0.55, 1);
+      for (let h = 0; h < H; h++) ampT[h] = rnd(0.35, 1.5);
+    }
+    f += (fT - f) * 0.0015;
+    env += (envT - env) * 0.0008;
+    phase += f / sr;
+    if (phase >= 1) phase -= 1;
+    let v = 0;
+    for (let h = 1; h <= H; h++) {
+      amp[h - 1] += (ampT[h - 1] - amp[h - 1]) * 0.0006;
+      v += Math.sin(2 * Math.PI * h * phase + h * 0.6) * amp[h - 1] / Math.pow(h, 0.95);
+    }
+    // Wing stroke: the downstroke is louder than the upstroke.
+    const stroke = 0.45 + 0.55 * Math.max(0, Math.sin(2 * Math.PI * phase + 0.4));
+    noise += (Math.random() * 2 - 1 - noise) * 0.25;   // dark breath noise
+    data[i] = (v * 0.5 + noise * 0.9 * stroke) * env;
+  }
+  // Seamless loop: fold the extra tail into the head.
+  const buf = audio.createBuffer(1, n, sr), out = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) {
+    out[i] = i < fade ? data[i] * (i / fade) + data[n + i] * (1 - i / fade) : data[i];
+  }
+  let peak = 0;
+  for (let i = 0; i < n; i++) peak = Math.max(peak, Math.abs(out[i]));
+  for (let i = 0; i < n; i++) out[i] /= peak || 1;
+  return buf;
+}
+function startBuzz(y) {
+  if (!ensureAudio() || buzz) return;
+  const t = audio.currentTime;
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  if (!buzzBuffers.length) buzzBuffers.push(renderBuzz(3.1), renderBuzz(3.7));
+
+  const out = audio.createGain();
+  out.gain.setValueAtTime(0.0001, t);
+  out.gain.exponentialRampToValueAtTime(0.34, t + 0.2);
+  const pan = audio.createStereoPanner ? audio.createStereoPanner() : null;
+  if (pan) out.connect(pan).connect(master); else out.connect(master);
+
+  // Thorax resonance: low, round and a bit hollow.
+  const lp = audio.createBiquadFilter();
+  lp.type = "lowpass"; lp.frequency.value = 650; lp.Q.value = 0.5;
+  const formant = audio.createBiquadFilter();
+  formant.type = "peaking"; formant.frequency.value = 300; formant.Q.value = 1.4; formant.gain.value = 6;
+  const body = audio.createGain();
+  body.gain.value = 0.8;
+  lp.connect(formant).connect(body).connect(out);
+
+  // Two wings = two slightly different, slightly detuned recordings that beat against each other.
+  const srcs = buzzBuffers.map((b, i) => {
+    const src = audio.createBufferSource();
+    src.buffer = b; src.loop = true;
+    src.playbackRate.value = 1 + i * 0.013;
+    src.loopStart = 0;
+    const g = audio.createGain();
+    g.gain.value = i ? 0.7 : 1;
+    src.connect(g).connect(lp);
+    src.start(t, Math.random() * b.duration);
+    return { src, mult: 1 + i * 0.013 };
+  });
+
+  const s = { out, pan, srcs, lp, body, y, rate: 1, timers: [] };
+  buzz = s;
+  const setRate = (r, now, tc) => { for (const { src, mult } of srcs) src.playbackRate.setTargetAtTime(r * mult, now, tc); };
+
+  const drift = () => {
+    if (buzz !== s) return;
+    const now = audio.currentTime;
+    const height = 1 - Math.min(1, Math.max(0, s.y / (innerHeight * DPR)));
+    s.rate = rnd(0.82, 1.12) * (1 + height * 0.3);
+    const tc = rnd(0.1, 0.22);
+    setRate(s.rate, now, tc);
+    lp.frequency.setTargetAtTime(rnd(450, 950), now, tc * 1.5);
+    formant.frequency.setTargetAtTime(rnd(240, 380), now, tc);
+    body.gain.setTargetAtTime(rnd(0.6, 1), now, tc);
+    if (Math.random() < 0.15) {   // fly-by: Doppler swoop, swell and stereo pass
+      const dir = Math.random() < 0.5 ? -1 : 1;
+      setRate(s.rate * 1.22, now + 0.1, 0.14);
+      setRate(s.rate * 0.85, now + 0.55, 0.2);
+      out.gain.setTargetAtTime(0.5, now, 0.15);
+      out.gain.setTargetAtTime(0.34, now + 0.55, 0.25);
+      if (pan) { pan.pan.setTargetAtTime(dir * 0.7, now, 0.2); pan.pan.setTargetAtTime(-dir * 0.7, now + 0.55, 0.2); pan.pan.setTargetAtTime(0, now + 1.2, 0.3); }
+    }
+    s.timers.push(setTimeout(drift, rnd(220, 480)));
+  };
+  drift();
+}
+function moveBuzz(y) { if (buzz) buzz.y = y; }
+function stopBuzz() {
+  if (!buzz) return;
+  const s = buzz, t = audio.currentTime;
+  buzz = null;
+  s.timers.forEach(clearTimeout);
+  s.out.gain.cancelScheduledValues(t);
+  s.out.gain.setValueAtTime(Math.max(s.out.gain.value, 0.0001), t);
+  s.out.gain.exponentialRampToValueAtTime(0.0001, t + 0.25);
+  for (const { src, mult } of s.srcs) { src.playbackRate.cancelScheduledValues(t); src.playbackRate.setTargetAtTime(s.rate * 0.6 * mult, t, 0.1); src.stop(t + 0.3); }
+}
+addEventListener("pointerdown", (e) => startBuzz(e.clientY * DPR));
+addEventListener("pointermove", (e) => moveBuzz(e.clientY * DPR));
+// ---------- the bee: follows the held finger with a lazy loop-the-loop ----------
+const bee = { x: 0, y: 0, vx: 0, vy: 0, on: false, t: 0, faceLeft: 1 };
+function beeStart(x, y) { bee.x = x; bee.y = y; bee.vx = bee.vy = 0; bee.on = true; }
+function beeStop() { bee.on = false; }
+addEventListener("pointerdown", (e) => beeStart(e.clientX * DPR, e.clientY * DPR));
+addEventListener("pointerup", beeStop);
+addEventListener("pointercancel", beeStop);
+addEventListener("blur", beeStop);
+addEventListener("pointerup", stopBuzz);
+addEventListener("pointercancel", stopBuzz);
+addEventListener("blur", stopBuzz);
 addEventListener("contextmenu", (e) => e.preventDefault());
 addEventListener("wheel", (e) => e.preventDefault(), { passive: false });
 
@@ -531,6 +656,17 @@ function frame(now) {
     if (s.age > 3 || s.x < -200 || s.x > W + 200 || s.y < -200 || s.y > H + 200) shooters.splice(i, 1);
   }
 
+  // bee: spring toward the finger, with a hovering wiggle
+  if (bee.on) {
+    bee.t += dt;
+    const tx = pointer.x + Math.cos(bee.t * 5) * 22 * DPR;
+    const ty = pointer.y + Math.sin(bee.t * 7) * 16 * DPR - 10 * DPR;
+    bee.vx = (bee.vx + (tx - bee.x) * 0.012 * k) * Math.pow(0.9, k);
+    bee.vy = (bee.vy + (ty - bee.y) * 0.012 * k) * Math.pow(0.9, k);
+    bee.x += bee.vx * k; bee.y += bee.vy * k;
+    if (Math.abs(bee.vx) > 0.4 * DPR) bee.faceLeft = bee.vx < 0 ? 1 : -1;
+  }
+
   // particles
   for (let i = particles.length - 1; i >= 0; i--) {
     const p = particles[i];
@@ -562,6 +698,20 @@ function frame(now) {
     ctx.drawImage(glowSprite(pointer.hue), pointer.x - r, pointer.y - r, r * 2, r * 2);
   }
   ctx.globalCompositeOperation = "source-over";
+
+  // the bee itself, tilting into its flight and buzzing its wings
+  if (bee.on) {
+    const size = 56 * DPR;
+    ctx.save();
+    ctx.translate(bee.x, bee.y + Math.sin(bee.t * 30) * 1.5 * DPR);
+    ctx.rotate(-Math.max(-0.5, Math.min(0.5, bee.vy * 0.04 / DPR)) * bee.faceLeft);
+    ctx.scale(bee.faceLeft * (1 + Math.sin(bee.t * 60) * 0.04), 1 + Math.sin(bee.t * 60 + 1) * 0.06);
+    ctx.font = `${size}px sans-serif`;
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.globalAlpha = 1;
+    ctx.fillText("🐝", 0, 0);
+    ctx.restore();
+  }
 
   // letters and emoji
   for (let i = items.length - 1; i >= 0; i--) {
